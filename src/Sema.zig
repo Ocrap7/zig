@@ -33131,6 +33131,9 @@ fn analyzeSlice(
                     slice_ty = ptr_ptr_child_ty;
                     array_ty = double_child_ty;
                     elem_ty = double_child_ty.childType(zcu);
+                } else if (double_child_ty.isTuple(zcu)) {
+                    slice_ty = ptr_ptr_child_ty;
+                    array_ty = double_child_ty;
                 } else {
                     const bounds_error_message = "slice of single-item pointer must have comptime-known bounds [0..0], [0..1], or [1..1]";
                     if (uncasted_end_opt == .none) {
@@ -33236,7 +33239,120 @@ fn analyzeSlice(
                 elem_ty = ptr_ptr_child_ty.childType(zcu);
             },
         },
+        .@"struct" => {},
         else => return sema.fail(block, src, "slice of non-array type '{}'", .{ptr_ptr_child_ty.fmt(pt)}),
+    }
+
+    if (array_ty.isTuple(zcu)) {
+        const ip = &zcu.intern_pool;
+        const struct_ty = array_ty;
+        const start = try sema.coerce(block, Type.usize, uncasted_start, start_src);
+
+        const end = if (by_length) end: {
+            const len = try sema.coerce(block, Type.usize, uncasted_end_opt, end_src);
+            const uncasted_end = try sema.analyzeArithmetic(block, .add, start, len, src, start_src, end_src, false);
+            break :end try sema.coerce(block, Type.usize, uncasted_end, end_src);
+        } else try sema.coerce(block, Type.usize, uncasted_end_opt, end_src);
+
+        if (try sema.resolveDefinedValue(block, end_src, end)) |end_val| {
+            if (try sema.resolveDefinedValue(block, start_src, start)) |start_val| {
+                if (!by_length and !(try sema.compareAll(start_val, .lte, end_val, Type.usize))) {
+                    return sema.fail(
+                        block,
+                        start_src,
+                        "start index {} is larger than end index {}",
+                        .{
+                            start_val.fmtValueSema(pt, sema),
+                            end_val.fmtValueSema(pt, sema),
+                        },
+                    );
+                }
+            }
+        }
+
+        const new_len = if (by_length)
+            try sema.coerce(block, Type.usize, uncasted_end_opt, end_src)
+        else
+            try sema.analyzeArithmetic(block, .sub, end, start, src, end_src, start_src, false);
+        const new_len_val = try sema.resolveDefinedValue(block, src, new_len) orelse return sema.fail(block, start_src, "tuple slice indicies are not comptime known", .{});
+        const new_len_int_val = new_len_val.toUnsignedInt(pt.zcu);
+
+        const tuple_field_start = try sema.resolveDefinedValue(block, src, start) orelse unreachable;
+
+        const field_name = try ip.getOrPutString(pt.zcu.gpa, pt.tid, "index", .no_embedded_nulls);
+        const field_start_val: u32 = @truncate(try (tuple_field_start.getUnsignedInt(pt.zcu) orelse sema.failWithBadStructFieldAccess(block, struct_ty, pt.zcu.intern_pool.loadStructType(struct_ty.toIntern()), start_src, field_name)));
+
+        const values = try sema.arena.alloc(Air.Inst.Ref, new_len_int_val);
+
+        var i: u32 = 0;
+        var is_comptime: bool = true;
+        var ptr_val: ?Air.Inst.Ref = null;
+        while (i < new_len_int_val) : (i += 1) {
+            if (struct_ty.structFieldIsComptime(i + field_start_val, zcu))
+                try struct_ty.resolveStructFieldInits(pt);
+            if (try struct_ty.structFieldValueComptime(pt, i + field_start_val)) |default_value| {
+                values[i] = Air.internedToRef(default_value.toIntern());
+            } else {
+                if (ptr_val == null) {
+                    ptr_val = try sema.analyzeLoad(block, src, ptr_or_slice, src);
+                }
+
+                values[i] = try sema.tupleFieldValByIndex(block, src, ptr_val.?, i + field_start_val, struct_ty);
+                is_comptime = false;
+            }
+        }
+
+        // for .struct_type, only keep default values if the field is comptime,
+        // since a default value in anon struct is considered comptime.
+        // for .anon_struct_type, keep default values.
+        const struct_types_and_values = switch (ip.indexToKey(struct_ty.toIntern())) {
+            .struct_type => blk: {
+                const default_values = try sema.arena.alloc(InternPool.Index, new_len_int_val);
+                const struct_type = ip.loadStructType(struct_ty.toIntern());
+
+                i = 0;
+                while (i < new_len_int_val) : (i += 1) {
+                    if (struct_type.comptime_bits.getBit(ip, i + field_start_val)) {
+                        default_values[i] = struct_type.field_inits.get(ip)[i + field_start_val];
+                    } else {
+                        default_values[i] = .none;
+                    }
+                }
+
+                break :blk .{
+                    struct_type.field_types.get(ip)[field_start_val .. field_start_val + new_len_int_val],
+                    default_values,
+                    struct_type.comptime_bits,
+                };
+            },
+            .anon_struct_type => |tuple| .{
+                tuple.types.get(ip)[field_start_val .. field_start_val + new_len_int_val],
+                tuple.values.get(ip)[field_start_val .. field_start_val + new_len_int_val],
+                InternPool.LoadedStructType.ComptimeBits.empty,
+            },
+            else => unreachable,
+        };
+
+        const tuple_ty = try ip.getAnonStructType(zcu.gpa, pt.tid, .{
+            .types = struct_types_and_values[0],
+            .values = struct_types_and_values[1],
+            .names = &.{},
+        });
+
+        if (is_comptime) {
+            const comptime_values = try sema.arena.alloc(InternPool.Index, new_len_int_val);
+            for (values, 0..) |value, j| {
+                comptime_values[j] = value.toInterned().?;
+            }
+            const tuple_val = try pt.intern(.{ .aggregate = .{
+                .ty = tuple_ty,
+                .storage = .{ .elems = comptime_values },
+            } });
+            return Air.internedToRef(tuple_val);
+        }
+
+        try sema.requireRuntimeBlock(block, src, start_src);
+        return block.addAggregateInit(Type.fromInterned(tuple_ty), values);
     }
 
     const ptr = if (slice_ty.isSlice(zcu))

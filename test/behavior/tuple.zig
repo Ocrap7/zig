@@ -579,3 +579,43 @@ test "tuple default values" {
     try expectEqual(123, t[1]);
     try expectEqual(456, t[2]);
 }
+
+test "tuple slicing" {
+    const T = struct {
+        f64,
+        bool = true,
+        u16 = 456,
+    };
+
+    const t: T = .{2.0};
+    const st = t[1..3];
+    const sst = st[1..2];
+
+    try expectEqual(2, st.len);
+    try expectEqual(true, st[0]);
+    try expectEqual(456, st[1]);
+    try expectEqual(456, sst[0]);
+}
+
+test "tuple slicing comptime" {
+    const T = struct {
+        f64 = 144.0,
+        comptime bool = false,
+        comptime u16 = 300,
+    };
+
+    const t: T = .{};
+    const st = t[0..2];
+
+    try expectEqual(2, st.len);
+    try expectEqual(144.0, st[0]);
+    try expectEqual(false, st[1]);
+
+    const st_info = @typeInfo(@TypeOf(st)).@"struct";
+    try expect(!st_info.fields[0].is_comptime);
+    try expect(st_info.fields[1].is_comptime);
+
+    const tt = struct { comptime u8 = 255 }{};
+    const stt = tt[0..1];
+    _ = &stt;
+}

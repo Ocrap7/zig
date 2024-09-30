@@ -3475,7 +3475,7 @@ pub const Object = struct {
 
                     comptime assert(struct_layout_version == 2);
                     var offset: u64 = 0;
-                    var big_align: InternPool.Alignment = .none;
+                    var big_align: InternPool.Alignment = .@"1";
 
                     const struct_size = t.abiSize(zcu);
 
@@ -3487,6 +3487,7 @@ pub const Object = struct {
                         if (field_val != .none) continue;
 
                         const field_align = Type.fromInterned(field_ty).abiAlignment(zcu);
+
                         big_align = big_align.max(field_align);
                         const prev_offset = offset;
                         offset = field_align.forward(offset);
